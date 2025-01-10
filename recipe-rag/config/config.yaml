@@ -1,0 +1,41 @@
+api:
+  openai:
+    model: "gpt-4o"
+    embedding_model: "text-embedding-ada-002"
+    max_tokens: 1000
+    temperature: 0.7
+
+vector_store:
+  pinecone:
+    index_name: "recipe-index"
+    namespace: "recipes"
+    dimension: 1536  # OpenAI embedding dimension
+
+preprocessing:
+  chunk_size: 500
+  chunk_overlap: 50
+  min_chunk_length: 100
+  
+  validators:
+    - check_recipe_format
+    - check_ingredients
+    - check_steps
+    
+  formatters:
+    - normalize_text
+    - extract_metadata
+    - structure_recipe
+
+data:
+  raw_path: "data/raw"
+  processed_path: "data/processed"
+  
+api:
+  host: "0.0.0.0"
+  port: 8000
+  docs_url: "/docs"
+  
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/app.log"
