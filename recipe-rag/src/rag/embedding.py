@@ -1,4 +1,3 @@
-# src/rag/embedding.py
 from typing import List, Dict, Any
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -8,6 +7,7 @@ from pinecone import Pinecone
 from dotenv import load_dotenv
 import os
 import time
+import re
 
 class RecipeVectorStore:
     def __init__(self):
@@ -17,15 +17,18 @@ class RecipeVectorStore:
         self.pc = Pinecone(
             api_key=os.getenv("PINECONE_API_KEY")
         )
-        self.index_name = "yooxicmanrag"
+        self.index_name = "yooxicman-ai"
         
         # 임베딩 모델 초기화
         self.embeddings = OpenAIEmbeddings(model='text-embedding-3-large')
         
-        # 텍스트 분할기 설정
+        # 텍스트 분할기 설정 수정
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500,
-            chunk_overlap=200
+            chunk_size=2000,  # 청크 크기 증가
+            chunk_overlap=300,  # 오버랩 증가
+            separators=["---", "\n레시피명:", "\nvideo_url:", "\n[", "\n#태그:","---"],  # 구분자 수정
+            length_function=len,
+            add_start_index=True,
         )
         
     def initialize_index(self) -> bool:
@@ -55,41 +58,42 @@ class RecipeVectorStore:
             
     def process_document(self, content: str) -> Dict[str, Any]:
         """문서 내용에서 메타데이터 추출"""
-        print("\n=== 문서 처리 시작 ===")
-        print(f"원본 내용:\n{content}\n")
+        # 레시피를 개별 문서로 분리
+        recipes = content.split("---")
+        recipes = [recipe.strip() for recipe in recipes if recipe.strip()]
         
-        # 제목 추출
-        title = "제목 없음"
-        if "레시피명:" in content:
-            title_lines = [line for line in content.split('\n') if "레시피명:" in line]
-            if title_lines:
-                title = title_lines[0].replace("레시피명:", "").strip()
+        metadata = {}
         
-        # URL 추출
-        youtube_url = ""
-        if "veido_url [URL]:" in content:
-            url_lines = [line for line in content.split('\n') if "veido_url [URL]:" in line]
-            if url_lines:
-                youtube_url = url_lines[0].replace("veido_url [URL]:", "").strip()
-        
-        # 재료 추출
-        ingredients = []
-        if "[완성재료/매인재료]" in content:
-            parts = content.split("[완성재료/매인재료]")
-            if len(parts) > 1:
-                ingredients_text = parts[1].split("[")[0]  # 다음 섹션 전까지
-                ingredients = [
-                    ing.strip() 
-                    for ing in ingredients_text.split('\n') 
-                    if ing.strip()
+        for recipe in recipes:
+            # 레시피명 추출
+            title_match = re.search(r'레시피명:\s*(.+?)(?=\n|$)', recipe)
+            metadata['title'] = title_match.group(1).strip() if title_match else "제목 없음"
+            
+            # 비디오 URL 추출
+            url_match = re.search(r'video_url:\s*(https?://[^\s]+)', recipe)
+            metadata['youtube_url'] = url_match.group(1).strip() if url_match else ""
+            
+            # 재료 섹션들 추출 (섹션별로 구분하여 저장)
+            ingredients_list = []  # 변경: 딕셔너리 대신 리스트 사용
+            sections = re.findall(r'\[(.*?)\](.*?)(?=\[|#태그:|$)', recipe, re.DOTALL)
+            for section_name, section_content in sections:
+                # 섹션 이름과 함께 재료를 리스트에 추가
+                section_ingredients = [
+                    f"{section_name.strip()}: {item.strip()}"
+                    for item in section_content.strip().split(',')
+                    if item.strip()
                 ]
+                ingredients_list.extend(section_ingredients)
+            
+            metadata['ingredients'] = ingredients_list  # 변경: 단순 리스트로 저장
+            
+            # 태그 추출
+            tags_match = re.search(r'#태그:\s*(.+?)(?=$)', recipe)
+            metadata['tags'] = [
+                tag.strip() 
+                for tag in tags_match.group(1).split(',')
+            ] if tags_match else []
         
-        metadata = {
-            "title": title,
-            "youtube_url": youtube_url,
-            "ingredients": ingredients
-        }
-        print(f"추출된 메타데이터: {metadata}")
         return metadata
 
     def add_documents(self, documents: List[Document]) -> bool:
@@ -99,6 +103,7 @@ class RecipeVectorStore:
             for doc in documents:
                 # 메타데이터 추출
                 metadata = self.process_document(doc.page_content)
+                
                 # 새 Document 객체 생성
                 processed_doc = Document(
                     page_content=doc.page_content,
@@ -130,18 +135,54 @@ class RecipeVectorStore:
             print(f"문서 추가 중 에러 발생: {str(e)}")
             return False
             
-    def similarity_search_with_score(self, query: str, k: int = 3) -> List[tuple[Document, float]]:
+    def similarity_search_with_score(
+        self, 
+        query: str, 
+        k: int = 3
+    ) -> List[tuple[Document, float]]:
         """유사도 점수와 함께 문서 검색"""
-        vector_store = PineconeVectorStore(
-            index=self.index,
-            embedding=self.embeddings
-        )
-        return vector_store.similarity_search_with_score(query, k=k)
+        try:
+            vector_store = PineconeVectorStore(
+                index=self.index,
+                embedding=self.embeddings
+            )
+            
+            # 기본 검색 결과 가져오기
+            results = vector_store.similarity_search_with_score(query, k=k*2)
+            
+            # 결과 후처리 및 순위 조정
+            processed_results = []
+            query_terms = set(query.lower().split())
+            
+            for doc, score in results:
+                # 메타데이터에서 태그와 재료 추출
+                metadata = doc.metadata
+                tags = set(tag.lower() for tag in metadata.get('tags', []))
+                ingredients = set(
+                    ing.lower().split(':')[-1].strip() 
+                    for ing in metadata.get('ingredients', [])
+                )
+                
+                # 태그 매칭 점수 계산
+                tag_match = len(query_terms & tags) / len(query_terms) if query_terms else 0
+                
+                # 재료 매칭 점수 계산
+                ingredient_match = len(query_terms & ingredients) / len(query_terms) if query_terms else 0
+                
+                # 최종 점수 계산 (벡터 유사도 + 태그 매칭 + 재료 매칭)
+                final_score = (float(score) + tag_match + ingredient_match) / 3
+                
+                processed_results.append((doc, final_score))
+            
+            # 최종 점수로 정렬하고 상위 k개 반환
+            processed_results.sort(key=lambda x: x[1], reverse=True)
+            return processed_results[:k]
+            
+        except Exception as e:
+            print(f"검색 중 에러 발생: {str(e)}")
+            return []
 
     def similarity_search(self, query: str, k: int = 3) -> List[Document]:
         """유사도 기반 문서 검색"""
-        vector_store = PineconeVectorStore(
-            index=self.index,
-            embedding=self.embeddings
-        )
-        return vector_store.similarity_search(query, k=k)
+        results = self.similarity_search_with_score(query, k=k)
+        return [doc for doc, _ in results]

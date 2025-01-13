@@ -39,7 +39,8 @@ def main():
             "src.api.main:app",
             host=host,
             port=port,
-            reload=False  # reload를 False로 변경
+            reload=False,
+            log_level="debug"  # 로그 레벨을 debug로 설정
         )
         
     except Exception as e:
